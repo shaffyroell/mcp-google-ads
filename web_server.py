@@ -18,9 +18,12 @@ Cloud Console.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
+import hmac
 import html
+import json
 import logging
 import os
 import secrets
@@ -143,14 +146,46 @@ def _page(body: str) -> HTMLResponse:
 # OAuth provider — proxies identity to Google
 # ---------------------------------------------------------------------------
 
-class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
-    """MCP OAuth AS that proxies authentication to Google OAuth 2.0."""
+# ---------------------------------------------------------------------------
+# Self-contained bearer tokens — survive server restarts, no DB needed.
+# Format: base64url(json_payload) + "." + hmac_sha256_hex
+# ---------------------------------------------------------------------------
 
-    def __init__(self) -> None:
+_TOKEN_TTL = 8 * 3600  # 8 hours
+
+
+def _encode_token(payload: dict, secret: str) -> str:
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    sig = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def _decode_token(token: str, secret: str) -> dict | None:
+    try:
+        body, sig = token.rsplit(".", 1)
+        expected = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(body))
+        if time.time() > payload.get("expires_at", 0):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
+    """MCP OAuth AS that proxies authentication to Google OAuth 2.0.
+
+    Bearer tokens are self-contained HMAC-signed payloads so they survive
+    server restarts without any external storage.
+    """
+
+    def __init__(self, secret_key: str) -> None:
+        self._secret = secret_key
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._auth_code_creds: dict[str, dict] = {}
-        self._tokens: dict[str, dict[str, Any]] = {}
         self._pending: dict[str, dict[str, Any]] = {}
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
@@ -196,18 +231,19 @@ class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
 
         del self._auth_codes[authorization_code.code]
 
-        bearer = secrets.token_urlsafe(32)
-        self._tokens[bearer] = {
+        expires_at = int(time.time()) + _TOKEN_TTL
+        payload = {
             "credentials": creds_data["credentials"],
             "email": creds_data["email"],
             "client_id": client.client_id,
-            "scopes": authorization_code.scopes,
-            "expires_at": int(time.time()) + 3600,
+            "scopes": list(authorization_code.scopes),
+            "expires_at": expires_at,
         }
+        bearer = _encode_token(payload, self._secret)
         return OAuthToken(
             access_token=bearer,
             token_type="Bearer",
-            expires_in=3600,
+            expires_in=_TOKEN_TTL,
             scope=" ".join(authorization_code.scopes),
         )
 
@@ -218,20 +254,21 @@ class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
         raise TokenError(error="unsupported_grant_type")
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        entry = self._tokens.get(token)
-        if not entry:
-            return None
-        if time.time() > entry["expires_at"]:
+        payload = _decode_token(token, self._secret)
+        if payload is None:
             return None
         return AccessToken(
             token=token,
-            client_id=entry["client_id"],
-            scopes=entry["scopes"],
-            expires_at=entry["expires_at"],
+            client_id=payload["client_id"],
+            scopes=payload["scopes"],
+            expires_at=payload["expires_at"],
         )
 
     async def revoke_token(self, token: AccessToken) -> None:
-        self._tokens.pop(token.token, None)
+        pass  # stateless tokens cannot be revoked; they expire naturally
+
+    def decode_token_payload(self, token: str) -> dict | None:
+        return _decode_token(token, self._secret)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +279,7 @@ def create_app() -> Starlette:
     secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
     base_url = os.environ.get("BASE_URL", "").rstrip("/")
 
-    provider = GoogleOAuthProvider()
+    provider = GoogleOAuthProvider(secret_key)
 
     # FastMCP stores the underlying lowlevel Server on _mcp_server.
     # All @mcp.tool / @mcp.prompt handlers registered in google_ads_server.py
@@ -438,14 +475,14 @@ def create_app() -> Starlette:
                 status_code=302,
             )
         else:
-            bearer = secrets.token_urlsafe(32)
-            provider._tokens[bearer] = {
+            payload = {
                 "credentials": creds_data,
                 "email": user_email,
                 "client_id": "browser",
                 "scopes": _SCOPES,
                 "expires_at": int(time.time()) + 86400,
             }
+            bearer = _encode_token(payload, secret_key)
             request.session["user_email"] = user_email
             request.session["bearer_token"] = bearer
             return RedirectResponse("/", status_code=302)
@@ -468,7 +505,6 @@ def create_app() -> Starlette:
         return RedirectResponse(auth_url)
 
     async def auth_logout(request: Request) -> Response:
-        provider._tokens.pop(request.session.get("bearer_token", ""), None)
         request.session.clear()
         return RedirectResponse("/")
 
@@ -522,12 +558,10 @@ def create_app() -> Starlette:
                 qs = scope.get("query_string", b"").decode()
                 token = (parse_qs(qs).get("token") or [None])[0]
 
-            access_token_obj = None
-            if token:
-                access_token_obj = await provider.load_access_token(token)
+            payload = provider.decode_token_payload(token) if token else None
 
-            if not access_token_obj or not token or token not in provider._tokens:
-                logger.warning("MCP /mcp: 401 — token=%s valid=%s", bool(token), bool(access_token_obj))
+            if not payload:
+                logger.warning("MCP /mcp: 401 — token=%s payload=%s", bool(token), bool(payload))
                 resp = Response(
                     status_code=401,
                     headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
@@ -535,7 +569,7 @@ def create_app() -> Starlette:
                 await resp(scope, receive, send)
                 return
 
-            creds = _creds_from_store(provider._tokens[token]["credentials"])
+            creds = _creds_from_store(payload["credentials"])
             ctx_token = _credentials_ctx.set(creds)
             try:
                 await session_manager.handle_request(scope, receive, send)
