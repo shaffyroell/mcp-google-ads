@@ -33,6 +33,15 @@ SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 # Allow HTTP for local dev; Railway sets BASE_URL to https so this is harmless there
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
+_MISSING_ENV_VARS = [
+    name for name, val in [
+        ("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID),
+        ("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET),
+        ("GOOGLE_ADS_DEVELOPER_TOKEN", os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "")),
+    ]
+    if not val
+]
+
 
 def _build_flow(state: str | None = None) -> Flow:
     return Flow.from_client_config(
@@ -69,6 +78,11 @@ def _creds_from_session(session: dict) -> Credentials | None:
 # ---------------------------------------------------------------------------
 
 async def health(request: Request) -> JSONResponse:
+    if _MISSING_ENV_VARS:
+        return JSONResponse(
+            {"status": "misconfigured", "missing": _MISSING_ENV_VARS},
+            status_code=500,
+        )
     return JSONResponse({"status": "ok"})
 
 
@@ -93,7 +107,15 @@ async def root(request: Request) -> HTMLResponse:
     )
 
 
-async def auth_login(request: Request) -> RedirectResponse:
+async def auth_login(request: Request) -> HTMLResponse | RedirectResponse:
+    if _MISSING_ENV_VARS:
+        missing = ", ".join(_MISSING_ENV_VARS)
+        return HTMLResponse(
+            f"<h1>Server misconfigured</h1>"
+            f"<p>Set these Railway environment variables and redeploy: "
+            f"<code>{missing}</code></p>",
+            status_code=500,
+        )
     flow = _build_flow()
     flow.redirect_uri = f"{BASE_URL}/auth/callback"
     auth_url, state = flow.authorization_url(
@@ -210,6 +232,16 @@ def run_web_server() -> None:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    if _MISSING_ENV_VARS:
+        logger.error(
+            "Missing required environment variables: %s  —  "
+            "set them in Railway and redeploy.",
+            ", ".join(_MISSING_ENV_VARS),
+        )
+    else:
+        logger.info("Google Ads MCP web server starting on port %s", port)
+        logger.info("MCP endpoint: %s/mcp", BASE_URL)
+        logger.info("OAuth login:  %s/auth/login", BASE_URL)
     uvicorn.run(create_app(), host="0.0.0.0", port=port)
 
 
