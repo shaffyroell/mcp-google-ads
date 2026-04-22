@@ -250,8 +250,7 @@ def create_app() -> Starlette:
     session_manager = StreamableHTTPSessionManager(
         app=fastmcp._mcp_server,
         json_response=False,
-        stateless=False,
-        session_idle_timeout=1800,
+        stateless=True,
     )
 
     issuer = base_url or "https://placeholder.invalid"
@@ -512,42 +511,36 @@ def create_app() -> Starlette:
                 return
 
             headers = dict(scope.get("headers", []))
-            session_id = headers.get(b"mcp-session-id")
+            token: str | None = None
 
-            if not session_id:
-                token: str | None = None
+            auth = headers.get(b"authorization", b"").decode()
+            if auth.startswith("Bearer "):
+                token = auth[7:]
 
-                auth = headers.get(b"authorization", b"").decode()
-                if auth.startswith("Bearer "):
-                    token = auth[7:]
+            if not token:
+                from urllib.parse import parse_qs
+                qs = scope.get("query_string", b"").decode()
+                token = (parse_qs(qs).get("token") or [None])[0]
 
-                if not token:
-                    from urllib.parse import parse_qs
-                    qs = scope.get("query_string", b"").decode()
-                    token = (parse_qs(qs).get("token") or [None])[0]
+            access_token_obj = None
+            if token:
+                access_token_obj = await provider.load_access_token(token)
 
-                access_token_obj = None
-                if token:
-                    access_token_obj = await provider.load_access_token(token)
+            if not access_token_obj or not token or token not in provider._tokens:
+                logger.warning("MCP /mcp: 401 — token=%s valid=%s", bool(token), bool(access_token_obj))
+                resp = Response(
+                    status_code=401,
+                    headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
+                )
+                await resp(scope, receive, send)
+                return
 
-                if not access_token_obj or not token or token not in provider._tokens:
-                    logger.warning("MCP /mcp: 401 — token=%s valid=%s", bool(token), bool(access_token_obj))
-                    resp = Response(
-                        status_code=401,
-                        headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
-                    )
-                    await resp(scope, receive, send)
-                    return
-
-                creds = _creds_from_store(provider._tokens[token]["credentials"])
-                ctx_token = _credentials_ctx.set(creds)
-                try:
-                    await session_manager.handle_request(scope, receive, send)
-                finally:
-                    _credentials_ctx.reset(ctx_token)
-            else:
-                # Existing session — credentials live in the spawned server task.
+            creds = _creds_from_store(provider._tokens[token]["credentials"])
+            ctx_token = _credentials_ctx.set(creds)
+            try:
                 await session_manager.handle_request(scope, receive, send)
+            finally:
+                _credentials_ctx.reset(ctx_token)
 
     # ------------------------------------------------------------------
     # Assemble Starlette app
