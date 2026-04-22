@@ -152,7 +152,7 @@ class _CredentialsMiddleware:
     and injects them into _credentials_ctx before delegating to the MCP app.
 
     Because asyncio copies the current context into every new task, any tasks
-    spawned by the MCP SSE handler also inherit the injected credentials.
+    spawned by the MCP handler also inherit the injected credentials.
     """
 
     def __init__(self, app) -> None:
@@ -172,25 +172,32 @@ class _CredentialsMiddleware:
 # ---------------------------------------------------------------------------
 
 def create_app() -> Starlette:
-    mcp_asgi = _CredentialsMiddleware(mcp.sse_app())
+    # streamable_http_app() exposes a single /mcp route (the modern MCP transport
+    # used by Claude.ai). We wrap it and mount at "/" so Starlette passes the full
+    # path "/mcp" to the inner app unchanged. Specific routes listed first take
+    # priority; everything else falls through to the MCP catch-all.
+    wrapped_mcp = _CredentialsMiddleware(mcp.streamable_http_app())
 
     routes = [
         Route("/", root),
         Route("/health", health),
         Route("/auth/login", auth_login),
         Route("/auth/callback", auth_callback),
-        Mount("/mcp", app=mcp_asgi),
+        Mount("/", app=wrapped_mcp),
     ]
 
-    # Use https_only cookies in production (BASE_URL starts with https)
+    # On Railway (HTTPS) use SameSite=None so Claude.ai's cross-origin POST
+    # requests to /mcp include the session cookie.  On plain HTTP (local dev)
+    # fall back to Lax (None requires Secure).
     https_only = BASE_URL.startswith("https://")
+    same_site = "none" if https_only else "lax"
 
     middleware = [
         Middleware(
             SessionMiddleware,
             secret_key=SECRET_KEY,
             https_only=https_only,
-            same_site="lax",
+            same_site=same_site,
         ),
     ]
 
