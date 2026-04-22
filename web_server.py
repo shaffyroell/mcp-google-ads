@@ -1,20 +1,60 @@
+"""HTTP-based MCP server with OAuth 2.0 authorization for cloud deployment.
+
+Uses the MCP SDK's built-in auth infrastructure (mcp.server.auth.*) so the
+OAuth endpoints are spec-correct and compatible with Claude.ai's MCP connector.
+Google OAuth is used as the identity provider.
+
+Setup
+-----
+  GOOGLE_CLIENT_ID      – OAuth 2.0 Web Application client ID
+  GOOGLE_CLIENT_SECRET  – OAuth 2.0 client secret
+  GOOGLE_ADS_DEVELOPER_TOKEN – Google Ads API developer token
+  SECRET_KEY            – Cookie signing secret (auto-generated if unset)
+  BASE_URL              – Public URL, e.g. https://my-app.up.railway.app
+  PORT                  – Listen port (default: 8080)
+
+Add  <BASE_URL>/auth/callback  as an authorised redirect URI in Google
+Cloud Console.
+"""
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import html
 import logging
 import os
 import secrets
+import time
+from typing import Any
 
-import uvicorn
+import httpx
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    TokenError,
+)
+from mcp.server.auth.routes import create_auth_routes
+from mcp.server.auth.settings import ClientRegistrationOptions
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
-from starlette.routing import Mount, Route
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
-from google_ads_server import _credentials_ctx, mcp
+from google_ads_server import _credentials_ctx
+from google_ads_server import mcp as fastmcp
+
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 logger = logging.getLogger(__name__)
 
@@ -25,168 +65,173 @@ _SCOPES = [
     "https://www.googleapis.com/auth/adwords",
 ]
 
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080")
-SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
-
-# Allow HTTP for local dev; Railway sets BASE_URL to https so this is harmless there
-os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
-
-_MISSING_ENV_VARS = [
-    name for name, val in [
-        ("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID),
-        ("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET),
-        ("GOOGLE_ADS_DEVELOPER_TOKEN", os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "")),
-    ]
-    if not val
-]
+_SCOPE_FINGERPRINT: str = hashlib.sha256(
+    " ".join(sorted(_SCOPES)).encode()
+).hexdigest()[:12]
 
 
-def _build_flow(state: str | None = None) -> Flow:
-    return Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [f"{BASE_URL}/auth/callback"],
-            }
-        },
-        scopes=_SCOPES,
-        state=state,
-    )
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _require_env(name: str) -> str:
+    v = os.environ.get(name)
+    if not v:
+        raise RuntimeError(f"Environment variable '{name}' is not set.")
+    return v
 
 
-def _creds_from_session(session: dict) -> Credentials | None:
-    data = session.get("credentials")
-    if not data:
-        return None
+def _get_base_url(request: Request) -> str:
+    explicit = os.environ.get("BASE_URL", "").rstrip("/")
+    if explicit:
+        return explicit
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.url.netloc)
+    return f"{scheme}://{host}"
+
+
+def _make_flow(redirect_uri: str) -> Flow:
+    client_config = {
+        "web": {
+            "client_id": _require_env("GOOGLE_CLIENT_ID"),
+            "client_secret": _require_env("GOOGLE_CLIENT_SECRET"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [redirect_uri],
+        }
+    }
+    return Flow.from_client_config(client_config, scopes=_SCOPES, redirect_uri=redirect_uri)
+
+
+def _creds_from_store(data: dict) -> Credentials:
     return Credentials(
         token=data["token"],
         refresh_token=data.get("refresh_token"),
         token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=data.get("client_id"),
-        client_secret=data.get("client_secret"),
-        scopes=data.get("scopes", _SCOPES),
+        client_id=data["client_id"],
+        client_secret=data["client_secret"],
+        scopes=data.get("scopes"),
     )
+
+
+async def _fetch_email(access_token: str) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+    return (resp.json() if resp.is_success else {}).get("email", "unknown")
+
+
+_PAGE = """\
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Google Ads MCP</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:700px;margin:60px auto;padding:0 20px;color:#333}}
+h1{{font-size:1.6rem}}pre{{background:#f5f5f5;padding:14px;border-radius:6px;overflow-x:auto;font-size:.9rem}}
+a.btn{{display:inline-block;padding:10px 22px;background:#4285f4;color:#fff;border-radius:5px;text-decoration:none;font-weight:500}}
+a.btn:hover{{background:#2b6fd4}}.label{{font-weight:600;margin-top:1.2rem;display:block}}</style>
+</head><body>{body}</body></html>"""
+
+
+def _page(body: str) -> HTMLResponse:
+    return HTMLResponse(_PAGE.format(body=body))
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# OAuth provider — proxies identity to Google
 # ---------------------------------------------------------------------------
 
-async def health(request: Request) -> JSONResponse:
-    if _MISSING_ENV_VARS:
-        return JSONResponse(
-            {"status": "misconfigured", "missing": _MISSING_ENV_VARS},
-            status_code=500,
+class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
+    """MCP OAuth AS that proxies authentication to Google OAuth 2.0."""
+
+    def __init__(self) -> None:
+        self._clients: dict[str, OAuthClientInformationFull] = {}
+        self._auth_codes: dict[str, AuthorizationCode] = {}
+        self._auth_code_creds: dict[str, dict] = {}
+        self._tokens: dict[str, dict[str, Any]] = {}
+        self._pending: dict[str, dict[str, Any]] = {}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self._clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self._clients[client_info.client_id] = client_info
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        base_url = os.environ.get("BASE_URL", "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("BASE_URL env var is required for MCP OAuth")
+
+        google_state = secrets.token_urlsafe(16)
+        callback_uri = f"{base_url}/auth/callback"
+        flow = _make_flow(callback_uri)
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            state=google_state,
         )
-    return JSONResponse({"status": "ok"})
-
-
-async def root(request: Request) -> HTMLResponse:
-    creds = _creds_from_session(request.session)
-    if creds:
-        body = "<p>Status: <strong>Connected</strong></p><p>MCP endpoint: <code>/mcp</code></p>"
-    else:
-        body = (
-            "<p>Status: <strong>Not connected</strong></p>"
-            '<p><a href="/auth/login">Connect your Google Account</a></p>'
-        )
-    return HTMLResponse(
-        f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>Google Ads MCP</title></head>
-<body>
-  <h1>Google Ads MCP</h1>
-  {body}
-</body>
-</html>"""
-    )
-
-
-async def auth_login(request: Request) -> HTMLResponse | RedirectResponse:
-    if _MISSING_ENV_VARS:
-        missing = ", ".join(_MISSING_ENV_VARS)
-        return HTMLResponse(
-            f"<h1>Server misconfigured</h1>"
-            f"<p>Set these Railway environment variables and redeploy: "
-            f"<code>{missing}</code></p>",
-            status_code=500,
-        )
-    flow = _build_flow()
-    flow.redirect_uri = f"{BASE_URL}/auth/callback"
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
-    request.session["oauth_state"] = state
-    return RedirectResponse(auth_url)
-
-
-async def auth_callback(request: Request) -> HTMLResponse:
-    state = request.session.get("oauth_state")
-    flow = _build_flow(state=state)
-    flow.redirect_uri = f"{BASE_URL}/auth/callback"
-
-    code = request.query_params.get("code")
-    if not code:
-        return HTMLResponse("Authorization failed: no code returned.", status_code=400)
-
-    try:
-        flow.fetch_token(code=code)
-        creds = flow.credentials
-        request.session["credentials"] = {
-            "token": creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_uri": creds.token_uri,
-            "client_id": creds.client_id,
-            "client_secret": creds.client_secret,
-            "scopes": list(creds.scopes) if creds.scopes else _SCOPES,
+        self._pending[google_state] = {
+            "params": params,
+            "client": client,
+            "code_verifier": getattr(flow, "code_verifier", None),
+            "callback_uri": callback_uri,
         }
-    except Exception:
-        logger.exception("OAuth callback error")
-        return HTMLResponse("Authorization failed. Check server logs.", status_code=400)
+        return auth_url
 
-    return HTMLResponse(
-        """<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>Google Ads MCP – Connected</title></head>
-<body>
-  <h1>Google Ads MCP – Connected!</h1>
-  <p>Authentication successful. You can close this tab.</p>
-  <p>The MCP server is available at <code>/mcp</code>.</p>
-</body>
-</html>"""
-    )
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        return self._auth_codes.get(authorization_code)
 
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        creds_data = self._auth_code_creds.pop(authorization_code.code, None)
+        if creds_data is None:
+            raise TokenError(error="invalid_grant", error_description="Credentials not found")
 
-# ---------------------------------------------------------------------------
-# Credentials injection middleware (ASGI)
-# ---------------------------------------------------------------------------
+        del self._auth_codes[authorization_code.code]
 
-class _CredentialsMiddleware:
-    """
-    Thin ASGI wrapper that reads Google credentials from the Starlette session
-    and injects them into _credentials_ctx before delegating to the MCP app.
+        bearer = secrets.token_urlsafe(32)
+        self._tokens[bearer] = {
+            "credentials": creds_data["credentials"],
+            "email": creds_data["email"],
+            "client_id": client.client_id,
+            "scopes": authorization_code.scopes,
+            "expires_at": int(time.time()) + 3600,
+        }
+        return OAuthToken(
+            access_token=bearer,
+            token_type="Bearer",
+            expires_in=3600,
+            scope=" ".join(authorization_code.scopes),
+        )
 
-    Because asyncio copies the current context into every new task, any tasks
-    spawned by the MCP handler also inherit the injected credentials.
-    """
+    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str):
+        return None
 
-    def __init__(self, app) -> None:
-        self.app = app
+    async def exchange_refresh_token(self, client, refresh_token, scopes):
+        raise TokenError(error="unsupported_grant_type")
 
-    async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] in ("http", "websocket"):
-            session = scope.get("session", {})
-            creds = _creds_from_session(session)
-            if creds is not None:
-                _credentials_ctx.set(creds)
-        await self.app(scope, receive, send)
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        entry = self._tokens.get(token)
+        if not entry:
+            return None
+        if time.time() > entry["expires_at"]:
+            return None
+        return AccessToken(
+            token=token,
+            client_id=entry["client_id"],
+            scopes=entry["scopes"],
+            expires_at=entry["expires_at"],
+        )
+
+    async def revoke_token(self, token: AccessToken) -> None:
+        self._tokens.pop(token.token, None)
 
 
 # ---------------------------------------------------------------------------
@@ -194,55 +239,359 @@ class _CredentialsMiddleware:
 # ---------------------------------------------------------------------------
 
 def create_app() -> Starlette:
-    # streamable_http_app() exposes a single /mcp route (the modern MCP transport
-    # used by Claude.ai). We wrap it and mount at "/" so Starlette passes the full
-    # path "/mcp" to the inner app unchanged. Specific routes listed first take
-    # priority; everything else falls through to the MCP catch-all.
-    wrapped_mcp = _CredentialsMiddleware(mcp.streamable_http_app())
+    secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+
+    provider = GoogleOAuthProvider()
+
+    # FastMCP stores the underlying lowlevel Server on _mcp_server.
+    # All @mcp.tool / @mcp.prompt handlers registered in google_ads_server.py
+    # are already wired up on this server object at import time.
+    session_manager = StreamableHTTPSessionManager(
+        app=fastmcp._mcp_server,
+        json_response=False,
+        stateless=False,
+        session_idle_timeout=1800,
+    )
+
+    issuer = base_url or "https://placeholder.invalid"
+    auth_routes = create_auth_routes(
+        provider=provider,
+        issuer_url=AnyHttpUrl(issuer),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=_SCOPES,
+            default_scopes=_SCOPES,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Override /.well-known/oauth-authorization-server to advertise
+    # token_endpoint_auth_method "none" (required for Claude.ai public
+    # clients; the SDK's built-in metadata omits it).
+    # ------------------------------------------------------------------
+
+    async def oauth_server_metadata(request: Request) -> JSONResponse:
+        base = _get_base_url(request)
+        metadata = {
+            "issuer": base,
+            "authorization_endpoint": f"{base}/authorize",
+            "token_endpoint": f"{base}/token",
+            "registration_endpoint": f"{base}/register",
+            "scopes_supported": _SCOPES,
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+            "code_challenge_methods_supported": ["S256"],
+        }
+        return JSONResponse(metadata, headers={"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------
+    # Custom /register — must shadow the SDK's built-in handler.
+    # Claude.ai registers with only ["authorization_code"] (public client
+    # per MCP spec); the SDK rejects that, so we normalise grant_types.
+    # ------------------------------------------------------------------
+
+    async def register_client(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+
+        logger.info("CLIENT REGISTRATION: body=%s", body)
+        grant_types: list = body.get("grant_types", ["authorization_code", "refresh_token"])
+        if "authorization_code" not in grant_types:
+            return JSONResponse(
+                {"error": "invalid_client_metadata",
+                 "error_description": "grant_types must include authorization_code"},
+                status_code=400,
+            )
+        if "refresh_token" not in grant_types:
+            grant_types = list(grant_types) + ["refresh_token"]
+
+        redirect_uris_raw: list = body.get("redirect_uris", [])
+        if not redirect_uris_raw:
+            return JSONResponse(
+                {"error": "invalid_client_metadata",
+                 "error_description": "redirect_uris is required"},
+                status_code=400,
+            )
+
+        auth_method: str = body.get("token_endpoint_auth_method") or "none"
+        client_secret = secrets.token_hex(32) if auth_method != "none" else None
+
+        import uuid
+        client_id = str(uuid.uuid4())
+        issued_at = int(time.time())
+
+        client_info = OAuthClientInformationFull(
+            client_id=client_id,
+            client_secret=client_secret,
+            client_id_issued_at=issued_at,
+            redirect_uris=redirect_uris_raw,
+            token_endpoint_auth_method=auth_method,
+            grant_types=grant_types,
+            response_types=body.get("response_types", ["code"]),
+            scope=" ".join(_SCOPES),
+        )
+        await provider.register_client(client_info)
+        logger.info("CLIENT REGISTERED: client_id=%s auth_method=%s", client_id, auth_method)
+
+        resp_body: dict = {
+            "client_id": client_id,
+            "client_id_issued_at": issued_at,
+            "redirect_uris": redirect_uris_raw,
+            "grant_types": grant_types,
+            "response_types": ["code"],
+            "token_endpoint_auth_method": auth_method,
+            "scope": " ".join(_SCOPES),
+        }
+        if client_secret:
+            resp_body["client_secret"] = client_secret
+        return JSONResponse(resp_body, status_code=201)
+
+    # ------------------------------------------------------------------
+    # Protected Resource Metadata (RFC 9728)
+    # ------------------------------------------------------------------
+
+    _wk_headers = {
+        "Cache-Control": "no-store, must-revalidate",
+        "ETag": f'"{_SCOPE_FINGERPRINT}"',
+    }
+
+    async def protected_resource_metadata(request: Request) -> JSONResponse:
+        base = _get_base_url(request)
+        return JSONResponse(
+            {"resource": base, "authorization_servers": [base], "scopes_supported": _SCOPES},
+            headers=_wk_headers,
+        )
+
+    # ------------------------------------------------------------------
+    # Google OAuth callback — shared by MCP flow and browser login
+    # ------------------------------------------------------------------
+
+    async def auth_callback(request: Request) -> Response:
+        code = request.query_params.get("code", "")
+        state = request.query_params.get("state", "")
+        error = request.query_params.get("error", "")
+
+        if error:
+            return _page(f"<h1>Sign-in failed</h1><p>{html.escape(error)}</p><p><a href='/'>Try again</a></p>")
+
+        is_mcp = state in provider._pending
+
+        if is_mcp:
+            pending = provider._pending.pop(state)
+            callback_uri = pending["callback_uri"]
+            code_verifier = pending.get("code_verifier")
+        else:
+            stored = request.session.pop("oauth_state", None)
+            if state != stored:
+                return _page("<h1>Invalid request</h1><p>State mismatch.</p><p><a href='/'>Try again</a></p>")
+            callback_uri = request.session.pop("redirect_uri", None)
+            code_verifier = request.session.pop("code_verifier", None)
+
+        try:
+            flow = _make_flow(callback_uri)
+            if code_verifier:
+                flow.code_verifier = code_verifier
+            flow.fetch_token(code=code)
+        except Exception as exc:
+            logger.exception("fetch_token failed")
+            return _page(f"<h1>Sign-in failed</h1><pre>{html.escape(str(exc))}</pre><p><a href='/'>Try again</a></p>")
+
+        creds = flow.credentials
+        user_email = await _fetch_email(creds.token)
+
+        creds_data = {
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": list(creds.scopes) if creds.scopes else _SCOPES,
+        }
+
+        if is_mcp:
+            params: AuthorizationParams = pending["params"]
+            client: OAuthClientInformationFull = pending["client"]
+            mcp_code = secrets.token_urlsafe(32)
+
+            auth_code_obj = AuthorizationCode(
+                code=mcp_code,
+                scopes=params.scopes or _SCOPES,
+                expires_at=time.time() + 600,
+                client_id=client.client_id,
+                code_challenge=params.code_challenge,
+                redirect_uri=params.redirect_uri,
+                redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            )
+            provider._auth_codes[mcp_code] = auth_code_obj
+            provider._auth_code_creds[mcp_code] = {
+                "credentials": creds_data,
+                "email": user_email,
+            }
+
+            redirect_uri_str = str(params.redirect_uri)
+            sep = "&" if "?" in redirect_uri_str else "?"
+            return RedirectResponse(
+                f"{redirect_uri_str}{sep}code={mcp_code}&state={params.state or ''}",
+                status_code=302,
+            )
+        else:
+            bearer = secrets.token_urlsafe(32)
+            provider._tokens[bearer] = {
+                "credentials": creds_data,
+                "email": user_email,
+                "client_id": "browser",
+                "scopes": _SCOPES,
+                "expires_at": int(time.time()) + 86400,
+            }
+            request.session["user_email"] = user_email
+            request.session["bearer_token"] = bearer
+            return RedirectResponse("/", status_code=302)
+
+    # ------------------------------------------------------------------
+    # Browser login helpers
+    # ------------------------------------------------------------------
+
+    async def auth_google(request: Request) -> Response:
+        base = _get_base_url(request)
+        uri = f"{base}/auth/callback"
+        flow = _make_flow(uri)
+        auth_url, state = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent"
+        )
+        request.session["oauth_state"] = state
+        request.session["redirect_uri"] = uri
+        if getattr(flow, "code_verifier", None):
+            request.session["code_verifier"] = flow.code_verifier
+        return RedirectResponse(auth_url)
+
+    async def auth_logout(request: Request) -> Response:
+        provider._tokens.pop(request.session.get("bearer_token", ""), None)
+        request.session.clear()
+        return RedirectResponse("/")
+
+    # ------------------------------------------------------------------
+    # Landing page and health
+    # ------------------------------------------------------------------
+
+    async def health(_request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    async def index(request: Request) -> HTMLResponse:
+        base = _get_base_url(request)
+        email = request.session.get("user_email")
+        body = (
+            f"<h1>Google Ads MCP Server</h1>"
+            + (f"<p>Signed in as <strong>{html.escape(email)}</strong></p>" if email else "")
+            + f'<span class="label">Add this URL to Claude.ai as a remote MCP server:</span>'
+            + f"<pre>{html.escape(base)}/mcp</pre>"
+            + "<p>Claude.ai will open a sign-in popup automatically.</p>"
+            + (
+                "<p><a href='/auth/logout' style='color:#888;font-size:.9rem'>Sign out</a></p>"
+                if email
+                else f"<br><a href='/auth/google' class='btn'>Sign in with Google</a>"
+            )
+        )
+        return _page(body)
+
+    # ------------------------------------------------------------------
+    # MCP endpoint — validates Bearer token then delegates to session manager
+    # ------------------------------------------------------------------
+
+    class _MCPAuthApp:
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] != "http":
+                return
+
+            headers = dict(scope.get("headers", []))
+            session_id = headers.get(b"mcp-session-id")
+
+            if not session_id:
+                token: str | None = None
+
+                auth = headers.get(b"authorization", b"").decode()
+                if auth.startswith("Bearer "):
+                    token = auth[7:]
+
+                if not token:
+                    from urllib.parse import parse_qs
+                    qs = scope.get("query_string", b"").decode()
+                    token = (parse_qs(qs).get("token") or [None])[0]
+
+                access_token_obj = None
+                if token:
+                    access_token_obj = await provider.load_access_token(token)
+
+                if not access_token_obj or not token or token not in provider._tokens:
+                    logger.warning("MCP /mcp: 401 — token=%s valid=%s", bool(token), bool(access_token_obj))
+                    resp = Response(
+                        status_code=401,
+                        headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
+                    )
+                    await resp(scope, receive, send)
+                    return
+
+                creds = _creds_from_store(provider._tokens[token]["credentials"])
+                ctx_token = _credentials_ctx.set(creds)
+                try:
+                    await session_manager.handle_request(scope, receive, send)
+                finally:
+                    _credentials_ctx.reset(ctx_token)
+            else:
+                # Existing session — credentials live in the spawned server task.
+                await session_manager.handle_request(scope, receive, send)
+
+    # ------------------------------------------------------------------
+    # Assemble Starlette app
+    # ------------------------------------------------------------------
 
     routes = [
-        Route("/", root),
-        Route("/health", health),
-        Route("/auth/login", auth_login),
+        # These MUST come before auth_routes to shadow the SDK's built-in handlers.
+        Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]),
+        Route("/register", register_client, methods=["POST"]),
+        *auth_routes,
+        Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
         Route("/auth/callback", auth_callback),
-        Mount("/", app=wrapped_mcp),
+        Route("/auth/google", auth_google),
+        Route("/auth/logout", auth_logout),
+        Route("/health", health),
+        Route("/", index),
+        Route("/mcp", _MCPAuthApp()),
     ]
 
-    # On Railway (HTTPS) use SameSite=None so Claude.ai's cross-origin POST
-    # requests to /mcp include the session cookie.  On plain HTTP (local dev)
-    # fall back to Lax (None requires Secure).
-    https_only = BASE_URL.startswith("https://")
-    same_site = "none" if https_only else "lax"
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            yield
 
-    middleware = [
-        Middleware(
-            SessionMiddleware,
-            secret_key=SECRET_KEY,
-            https_only=https_only,
-            same_site=same_site,
-        ),
-    ]
-
-    return Starlette(routes=routes, middleware=middleware)
+    app = Starlette(
+        routes=routes,
+        middleware=[
+            Middleware(
+                SessionMiddleware,
+                secret_key=secret_key,
+                max_age=86400,
+                https_only=False,
+            )
+        ],
+        lifespan=lifespan,
+    )
+    return app
 
 
 def run_web_server() -> None:
+    import uvicorn
     port = int(os.environ.get("PORT", 8080))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    if _MISSING_ENV_VARS:
-        logger.error(
-            "Missing required environment variables: %s  —  "
-            "set them in Railway and redeploy.",
-            ", ".join(_MISSING_ENV_VARS),
-        )
-    else:
-        logger.info("Google Ads MCP web server starting on port %s", port)
-        logger.info("MCP endpoint: %s/mcp", BASE_URL)
-        logger.info("OAuth login:  %s/auth/login", BASE_URL)
-    uvicorn.run(create_app(), host="0.0.0.0", port=port)
+    logger.info("Google Ads MCP web server starting on port %s", port)
+    logger.info("MCP endpoint: %s/mcp", os.environ.get("BASE_URL", f"http://localhost:{port}"))
+    uvicorn.run(create_app(), host="0.0.0.0", port=port, log_level="info")
 
 
 if __name__ == "__main__":
