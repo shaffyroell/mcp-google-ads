@@ -483,12 +483,17 @@ def create_app() -> Starlette:
     async def index(request: Request) -> HTMLResponse:
         base = _get_base_url(request)
         email = request.session.get("user_email")
+        callback_uri = f"{html.escape(base)}/auth/callback"
         body = (
             f"<h1>Google Ads MCP Server</h1>"
             + (f"<p>Signed in as <strong>{html.escape(email)}</strong></p>" if email else "")
-            + f'<span class="label">Add this URL to Claude.ai as a remote MCP server:</span>'
+            + f'<span class="label">1. Add this URL to Claude.ai as a remote MCP server:</span>'
             + f"<pre>{html.escape(base)}/mcp</pre>"
-            + "<p>Claude.ai will open a sign-in popup automatically.</p>"
+            + f'<span class="label">2. Required: Register this Authorized Redirect URI in <a href="https://console.cloud.google.com/apis/credentials" target="_blank">Google Cloud Console</a> (Credentials → OAuth 2.0 Client → Authorized redirect URIs):</span>'
+            + f'<pre style="border:2px solid #e53935;color:#e53935">{callback_uri}</pre>'
+            + '<p style="color:#555;font-size:.9rem">⚠️ Your OAuth client must be type <strong>Web application</strong> (not Desktop app). '
+            + 'If you see a <em>redirect_uri_mismatch</em> error from Google, add the URI above to your OAuth client\'s authorized redirect URIs.</p>'
+            + "<p>Claude.ai will open a sign-in popup automatically once the redirect URI is registered.</p>"
             + (
                 "<p><a href='/auth/logout' style='color:#888;font-size:.9rem'>Sign out</a></p>"
                 if email
@@ -548,6 +553,26 @@ def create_app() -> Starlette:
     # Assemble Starlette app
     # ------------------------------------------------------------------
 
+    async def setup(request: Request) -> HTMLResponse:
+        base = _get_base_url(request)
+        callback_uri = f"{base}/auth/callback"
+        body = (
+            "<h1>Setup Checklist</h1>"
+            "<p>Complete these steps before connecting Claude.ai:</p>"
+            "<ol>"
+            "<li><strong>Google Cloud Console</strong> → Credentials → your OAuth 2.0 Client<br>"
+            "&nbsp;&nbsp;• Client type must be <strong>Web application</strong> (not Desktop app)<br>"
+            f"&nbsp;&nbsp;• Add this to <strong>Authorized redirect URIs</strong>:</li>"
+            f'</ol><pre style="border:2px solid #e53935;color:#e53935;margin:4px 0 12px">{html.escape(callback_uri)}</pre>'
+            "<ol start='2'>"
+            "<li>Set environment variable <code>BASE_URL</code> to your server's public URL: "
+            f"<code>{html.escape(base)}</code></li>"
+            "<li>Add this MCP URL to Claude.ai:</li>"
+            f"</ol><pre>{html.escape(base)}/mcp</pre>"
+            f'<p><a href="/">← Back</a></p>'
+        )
+        return _page(body)
+
     routes = [
         # These MUST come before auth_routes to shadow the SDK's built-in handlers.
         Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]),
@@ -558,6 +583,7 @@ def create_app() -> Starlette:
         Route("/auth/google", auth_google),
         Route("/auth/logout", auth_logout),
         Route("/health", health),
+        Route("/setup", setup),
         Route("/", index),
         Route("/mcp", _MCPAuthApp()),
     ]
