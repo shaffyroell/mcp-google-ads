@@ -41,6 +41,9 @@ google-ads-mcp-web = "web_server:run_web_server"
 "Homepage" = "https://github.com/cohnen/mcp-google-ads"
 "Bug Tracker" = "https://github.com/cohnen/mcp-google-ads/issues"
 
+[tool.setuptools]
+packages = []
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
