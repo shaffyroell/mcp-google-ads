@@ -573,6 +573,19 @@ def create_app() -> Starlette:
         )
         return _page(body)
 
+    async def debug(request: Request) -> JSONResponse:
+        base_from_env = os.environ.get("BASE_URL", "").rstrip("/")
+        base_from_request = _get_base_url(request)
+        callback_uri_mcp = f"{base_from_env}/auth/callback" if base_from_env else "(BASE_URL not set — MCP auth will fail)"
+        callback_uri_browser = f"{base_from_request}/auth/callback"
+        return JSONResponse({
+            "BASE_URL_env": base_from_env or "(not set)",
+            "base_url_from_request_headers": base_from_request,
+            "redirect_uri_sent_to_google_for_mcp_flow": callback_uri_mcp,
+            "redirect_uri_sent_to_google_for_browser_flow": callback_uri_browser,
+            "action_required": "Register 'redirect_uri_sent_to_google_for_mcp_flow' in Google Cloud Console → Credentials → OAuth Client → Authorized redirect URIs",
+        })
+
     routes = [
         # These MUST come before auth_routes to shadow the SDK's built-in handlers.
         Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]),
@@ -584,6 +597,7 @@ def create_app() -> Starlette:
         Route("/auth/logout", auth_logout),
         Route("/health", health),
         Route("/setup", setup),
+        Route("/debug", debug),
         Route("/", index),
         Route("/mcp", _MCPAuthApp()),
     ]
