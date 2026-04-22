@@ -6,12 +6,12 @@ Google OAuth is used as the identity provider.
 
 Setup
 -----
-  GOOGLE_CLIENT_ID      – OAuth 2.0 Web Application client ID
-  GOOGLE_CLIENT_SECRET  – OAuth 2.0 client secret
+  GOOGLE_ADS_CLIENT_ID      – OAuth 2.0 Web Application client ID
+  GOOGLE_ADS_CLIENT_SECRET  – OAuth 2.0 client secret
   GOOGLE_ADS_DEVELOPER_TOKEN – Google Ads API developer token
-  SECRET_KEY            – Cookie signing secret (auto-generated if unset)
-  BASE_URL              – Public URL, e.g. https://my-app.up.railway.app
-  PORT                  – Listen port (default: 8080)
+  SECRET_KEY                – Cookie signing secret (auto-generated if unset)
+  BASE_URL                  – Public URL, e.g. https://my-app.up.railway.app
+  PORT                      – Listen port (default: 8080)
 
 Add  <BASE_URL>/auth/callback  as an authorised redirect URI in Google
 Cloud Console.
@@ -93,8 +93,8 @@ def _get_base_url(request: Request) -> str:
 def _make_flow(redirect_uri: str) -> Flow:
     client_config = {
         "web": {
-            "client_id": _require_env("GOOGLE_CLIENT_ID"),
-            "client_secret": _require_env("GOOGLE_CLIENT_SECRET"),
+            "client_id": _require_env("GOOGLE_ADS_CLIENT_ID"),
+            "client_secret": _require_env("GOOGLE_ADS_CLIENT_SECRET"),
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "redirect_uris": [redirect_uri],
