@@ -25,6 +25,18 @@ dependencies = [
     "mcp[cli]>=1.3.0",
 ]
 
+[project.optional-dependencies]
+web = [
+    "uvicorn[standard]>=0.34.0",
+    "google-auth-oauthlib>=1.2.0",
+    "itsdangerous>=2.2.0",
+    "starlette>=0.46.0",
+    "httpx>=0.28.1",
+]
+
+[project.scripts]
+google-ads-mcp-web = "web_server:run_web_server"
+
 [project.urls]
 "Homepage" = "https://github.com/cohnen/mcp-google-ads"
 "Bug Tracker" = "https://github.com/cohnen/mcp-google-ads/issues"

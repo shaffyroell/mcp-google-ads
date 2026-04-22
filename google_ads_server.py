@@ -3,6 +3,7 @@ from pydantic import Field
 import os
 import json
 import requests
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 import logging
+
+_credentials_ctx: ContextVar = ContextVar("_credentials_ctx", default=None)
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -66,14 +69,14 @@ def format_customer_id(customer_id: str) -> str:
 def get_credentials():
     """
     Get and refresh OAuth credentials or service account credentials based on the auth type.
-    
-    This function supports two authentication methods:
-    1. OAuth 2.0 (User Authentication) - For individual users or desktop applications
-    2. Service Account (Server-to-Server Authentication) - For automated systems
 
-    Returns:
-        Valid credentials object to use with Google Ads API
+    In web/Railway deployments the web_server injects per-user credentials via
+    _credentials_ctx; those take priority over any env-based config.
     """
+    ctx_creds = _credentials_ctx.get()
+    if ctx_creds is not None:
+        return ctx_creds
+
     if not GOOGLE_ADS_CREDENTIALS_PATH:
         raise ValueError("GOOGLE_ADS_CREDENTIALS_PATH environment variable not set")
     
@@ -201,8 +204,12 @@ def get_oauth_credentials():
     
     return creds
 
-def get_headers(creds):
+def get_headers(creds=None):
     """Get headers for Google Ads API requests."""
+    if creds is None:
+        creds = _credentials_ctx.get()
+    if creds is None:
+        creds = get_credentials()
     if not GOOGLE_ADS_DEVELOPER_TOKEN:
         raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set")
     
